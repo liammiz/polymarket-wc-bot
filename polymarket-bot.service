@@ -1,0 +1,19 @@
+[Unit]
+Description=Polymarket World Cup Copy-Trading Bot (poller)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/polymarket-wc-bot
+ExecStart=/home/ubuntu/polymarket-wc-bot/venv/bin/python poller.py
+Restart=always
+RestartSec=15
+StandardOutput=append:/home/ubuntu/polymarket-wc-bot/bot.log
+StandardError=append:/home/ubuntu/polymarket-wc-bot/bot.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

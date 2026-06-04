@@ -1,0 +1,19 @@
+# Core
+APScheduler==3.10.4
+python-dotenv==1.0.1
+requests==2.32.3
+
+# Polymarket CLOB client
+py-clob-client==0.15.0
+
+# Telegram
+python-telegram-bot==21.5
+
+# Dashboard
+streamlit==1.37.1
+streamlit-autorefresh==1.0.1
+pandas==2.2.2
+plotly==5.23.0
+
+# Async / utilities
+aiohttp==3.10.5
