@@ -21,11 +21,15 @@ from typing import Dict, List, Optional, Set
 
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import ApiCreds, FilterParams
 
 from config import (
     CLOB_BASE_URL, POLL_INTERVAL_SECONDS, MIN_TRADE_SIZE_USD,
     WIN_RATE_THRESHOLD, WC_KEYWORDS, PHASE_THRESHOLD, LOG_PATH,
     DRY_RUN, STARTING_CAPITAL, MIN_TRADES_ELIGIBLE,
+    POLY_PRIVATE_KEY, POLY_API_KEY, POLY_API_SECRET,
+    POLY_API_PASSPHRASE, POLY_CHAIN_ID,
 )
 import db
 import scorer
@@ -50,6 +54,19 @@ def setup_logging() -> None:
 
 
 logger = logging.getLogger(__name__)
+
+# /trades requires L2-authenticated requests; build the client once so the
+# signing key/creds aren't re-derived every poll cycle.
+_clob_client = ClobClient(
+    host=CLOB_BASE_URL,
+    key=POLY_PRIVATE_KEY,
+    chain_id=POLY_CHAIN_ID,
+    creds=ApiCreds(
+        api_key=POLY_API_KEY,
+        api_secret=POLY_API_SECRET,
+        api_passphrase=POLY_API_PASSPHRASE,
+    ),
+)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -252,14 +269,12 @@ def poll_trades() -> None:
     last_ts_str = db.get_meta("last_poll_ts")
     after_ts: Optional[int] = int(last_ts_str) if last_ts_str else None
 
-    params: dict = {"limit": 500}
+    filter_params = FilterParams(limit=500)
     if after_ts:
-        params["after"] = after_ts
+        filter_params.after = after_ts
 
     try:
-        resp = requests.get(f"{CLOB_BASE_URL}/trades", params=params, timeout=20)
-        resp.raise_for_status()
-        raw_trades: list = resp.json().get("data", [])
+        raw_trades: list = _clob_client.get_trades(params=filter_params) or []
     except Exception as exc:
         logger.error("Trade fetch failed: %s", exc)
         return
