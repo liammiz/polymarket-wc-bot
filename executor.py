@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, Generator, Tuple
 
 from config import (
@@ -64,6 +65,46 @@ def _place_order(token_id: str, price: float, size_tokens: float) -> Optional[st
     return resp.get("orderID") or resp.get("order_id", "unknown")
 
 
+# ── Trade guards ─────────────────────────────────────────────────────────────
+
+def is_market_expiring_soon(market_id: str, hours: int = 72) -> bool:
+    """Return True if the market resolves within `hours` hours from now.
+
+    If end_date is missing we allow through to avoid silently dropping trades
+    on markets where the CLOB API omits the field.
+    """
+    market = db.get_market(market_id)
+    if not market:
+        return False
+    end_date_str = market.get("end_date")
+    if not end_date_str:
+        return True  # unknown — allow through
+    try:
+        end_dt = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+        if end_dt.tzinfo is None:
+            end_dt = end_dt.replace(tzinfo=timezone.utc)
+        return end_dt <= datetime.now(timezone.utc) + timedelta(hours=hours)
+    except Exception as e:
+        logger.warning("Cannot parse end_date '%s' for %s: %s", end_date_str, market_id, e)
+        return True  # parse error — allow through
+
+
+def has_contradicting_position(market_id: str, outcome: str) -> bool:
+    """True if an open position exists on the same market with a *different* outcome."""
+    for pos in db.get_open_positions():
+        if pos["market_id"] == market_id and pos["outcome"].lower() != outcome.lower():
+            return True
+    return False
+
+
+def has_duplicate_position(market_id: str, outcome: str) -> bool:
+    """True if an open position already exists for the exact same market + outcome."""
+    for pos in db.get_open_positions():
+        if pos["market_id"] == market_id and pos["outcome"].lower() == outcome.lower():
+            return True
+    return False
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def execute_copy_trade(whale_trade: Dict, portfolio_value: float) -> Optional[Dict]:
@@ -96,6 +137,18 @@ def execute_copy_trade(whale_trade: Dict, portfolio_value: float) -> Optional[Di
 
     if side != "BUY":
         logger.debug("Skipping non-BUY trade from %s", whale_address)
+        return None
+
+    if not is_market_expiring_soon(market_id):
+        logger.info("[SKIP] Market expires too far out: %s", market_name)
+        return None
+
+    if has_contradicting_position(market_id, outcome):
+        logger.info("[SKIP] Contradicting position already open for market: %s", market_name)
+        return None
+
+    if has_duplicate_position(market_id, outcome):
+        logger.info("[SKIP] Position already open: %s %s", market_name, outcome)
         return None
 
     wallet = db.get_wallet(whale_address)

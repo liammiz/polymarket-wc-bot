@@ -164,6 +164,11 @@ def refresh_wc_markets() -> None:
             active = not (m.get("closed") or m.get("resolved"))
             resolved = bool(m.get("resolved"))
             winning_outcome = m.get("outcome") or m.get("winning_outcome")
+            end_date = (
+                m.get("end_date_iso")
+                or m.get("endDate")
+                or m.get("end_date")
+            )
 
             db.upsert_market(
                 market_id=market_id,
@@ -172,6 +177,7 @@ def refresh_wc_markets() -> None:
                 active=active,
                 resolved=resolved,
                 winning_outcome=winning_outcome,
+                end_date=end_date,
             )
             found += 1
 

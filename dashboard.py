@@ -8,11 +8,14 @@ Reads exclusively from whales.db — never writes market orders directly
 (that path goes through executor.execute_manual_topup).
 """
 
+import re
+import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from datetime import datetime, timezone
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
 # Ensure project root is on path when launched from any CWD
@@ -20,7 +23,12 @@ sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 import db
 import executor
-from config import STARTING_CAPITAL, DRY_RUN, PHASE_THRESHOLD, GAME_CAP_PCT
+from config import (
+    DRY_RUN, GAME_CAP_PCT, MIN_TRADE_SIZE_USD, MIN_TRADES_ELIGIBLE,
+    PHASE_THRESHOLD, STARTING_CAPITAL, WIN_RATE_THRESHOLD,
+)
+
+_ENV_PATH = Path(__file__).parent / ".env"
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -31,12 +39,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Optional auto-refresh (30 s) — silently skipped if package absent
-try:
-    from streamlit_autorefresh import st_autorefresh
-    st_autorefresh(interval=30_000, key="autorefresh")
-except ImportError:
-    pass
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=30_000, key="autorefresh")
 
 db.init_db()
 
@@ -46,8 +50,11 @@ db.init_db()
 def fmt_usd(v) -> str:
     if v is None:
         return "—"
-    sign = "+" if v > 0 else ""
-    return f"{sign}${v:,.2f}" if v < 0 else f"${v:,.2f}"
+    if v > 0:
+        return f"+${v:,.2f}"
+    elif v < 0:
+        return f"-${abs(v):,.2f}"
+    return "$0.00"
 
 
 def fmt_pct(v) -> str:
@@ -60,8 +67,28 @@ def short_addr(a: str) -> str:
     return a or "—"
 
 
-def pnl_color(v: float) -> str:
-    return "green" if v >= 0 else "red"
+def _pnl_cell_style(val: str) -> str:
+    """Styler function: colour green/red based on the sign of a fmt_usd string."""
+    s = str(val).replace("$", "").replace("+", "").replace(",", "").strip()
+    try:
+        num = float(s)
+        if num > 0:
+            return "color: #28a745; font-weight: bold"
+        elif num < 0:
+            return "color: #dc3545; font-weight: bold"
+    except Exception:
+        pass
+    return ""
+
+
+def _write_env_key(key: str, value: str) -> None:
+    """Replace a KEY=value line in .env in-place; append if the key is absent."""
+    text = _ENV_PATH.read_text(encoding="utf-8")
+    pattern = rf"^{re.escape(key)}=.*$"
+    new_text = re.sub(pattern, f"{key}={value}", text, flags=re.MULTILINE)
+    if f"{key}=" not in new_text:
+        new_text += f"\n{key}={value}"
+    _ENV_PATH.write_text(new_text, encoding="utf-8")
 
 
 # ── Header ────────────────────────────────────────────────────────────────────
@@ -82,20 +109,22 @@ st.divider()
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 
-tab_port, tab_whales, tab_open, tab_closed, tab_override = st.tabs([
+tab_port, tab_whales, tab_open, tab_closed, tab_override, tab_settings = st.tabs([
     "📊 Portfolio",
     "🐋 Whales",
     "📂 Open Positions",
     "✅ Closed Positions",
     "🎛️ Manual Override",
+    "⚙️ Settings",
 ])
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # TAB 1 — Portfolio overview
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 with tab_port:
     st.header("Portfolio Overview")
+    st.info(f"{phase_label}  |  {games} / {PHASE_THRESHOLD} games completed")
 
     portfolio = db.get_latest_portfolio()
     open_positions = db.get_open_positions()
@@ -110,8 +139,7 @@ with tab_port:
     c1.metric("Portfolio Value", f"${total_value:,.2f}")
     c2.metric("Currently Invested", f"${invested:,.2f}")
     c3.metric("Free Capital", f"${free:,.2f}")
-    delta_str = fmt_usd(total_pnl)
-    c4.metric("Total P&L", f"${abs(total_pnl):,.2f}", delta=delta_str)
+    c4.metric("Total P&L", fmt_usd(total_pnl), delta=fmt_usd(total_pnl))
 
     st.divider()
 
@@ -126,16 +154,63 @@ with tab_port:
     c7.metric("Open Positions", len(open_positions))
     c8.metric("Closed Positions", len(closed_positions))
 
+    st.divider()
+
+    # Equity curve
+    snapshots = db.get_portfolio_snapshots(500)
+    if snapshots:
+        snap_df = pd.DataFrame(snapshots)
+        snap_df["snapshot_at"] = pd.to_datetime(snap_df["snapshot_at"], utc=True)
+        snap_df = snap_df.sort_values("snapshot_at")
+
+        st.subheader("Equity Curve")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=snap_df["snapshot_at"],
+            y=snap_df["total_value"],
+            mode="lines",
+            name="Portfolio Value",
+            line=dict(color="#1f77b4", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(31,119,180,0.1)",
+        ))
+        fig.update_layout(
+            xaxis_title="Time (UTC)",
+            yaxis_title="Portfolio Value (USD)",
+            height=350,
+            margin=dict(l=0, r=0, t=20, b=0),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 24-hour sparkline
+        cutoff = pd.Timestamp(datetime.now(timezone.utc) - timedelta(hours=24))
+        snap_24h = snap_df[snap_df["snapshot_at"] >= cutoff]
+        if len(snap_24h) > 1:
+            st.subheader("Last 24 Hours")
+            fig24 = go.Figure()
+            fig24.add_trace(go.Scatter(
+                x=snap_24h["snapshot_at"],
+                y=snap_24h["total_value"],
+                mode="lines",
+                line=dict(color="#ff7f0e", width=2),
+            ))
+            fig24.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=0))
+            st.plotly_chart(fig24, use_container_width=True)
+    else:
+        st.info("No portfolio history yet — snapshots are written every poll cycle.")
+
     st.caption(
         f"Last updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC"
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # TAB 2 — Followed whales
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 with tab_whales:
     st.header("Whale Tracker")
+    st.info(f"{phase_label}  |  {games} / {PHASE_THRESHOLD} games completed")
 
     wallets = db.get_all_wallets()
 
@@ -148,19 +223,38 @@ with tab_whales:
 
         ca, cb, cc, cd = st.columns(4)
         ca.metric("Total Wallets", len(wallets))
-        cb.metric("Followed", len(followed), help="win rate ≥ 80% and ≥ 5 trades")
+        cb.metric("Followed", len(followed), help="win rate ≥ threshold and ≥ min trades")
         cc.metric("Watching", len(watching))
         cd.metric("Demoted", len(demoted))
 
         st.divider()
 
-        filter_status = st.selectbox(
-            "Filter by status", ["All", "followed", "watching", "demoted"]
-        )
-        display = (
-            wallets if filter_status == "All"
-            else [w for w in wallets if w["status"] == filter_status]
-        )
+        with st.expander("Filters & Sorting", expanded=True):
+            fcol1, fcol2, fcol3, fcol4 = st.columns(4)
+            with fcol1:
+                filter_status = st.selectbox(
+                    "Status", ["All", "followed", "watching", "demoted"], key="whale_status"
+                )
+            with fcol2:
+                min_win_rate = st.slider(
+                    "Min Win Rate", 0.0, 1.0, 0.0, step=0.05, key="whale_min_wr"
+                )
+            with fcol3:
+                min_trade_count = st.number_input(
+                    "Min Trades", min_value=0, max_value=100, value=0, key="whale_min_tc"
+                )
+            with fcol4:
+                sort_by = st.selectbox(
+                    "Sort By", ["Win Rate", "Trade Count", "ROI"], key="whale_sort"
+                )
+
+        display = wallets
+        if filter_status != "All":
+            display = [w for w in display if w["status"] == filter_status]
+        display = [w for w in display if w["win_rate"] >= min_win_rate]
+        display = [w for w in display if w["trade_count"] >= min_trade_count]
+        sort_key = {"Win Rate": "win_rate", "Trade Count": "trade_count", "ROI": "roi"}[sort_by]
+        display = sorted(display, key=lambda w: w.get(sort_key) or 0.0, reverse=True)
 
         rows = []
         for w in display:
@@ -178,20 +272,23 @@ with tab_whales:
 
         if rows:
             df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
+            styled = df.style.map(_pnl_cell_style, subset=["Total P&L"])
+            st.dataframe(styled, use_container_width=True, hide_index=True)
             st.markdown(
                 "> **FOLLOWED** = copying trades | "
                 "**WATCHING** = monitoring | "
-                "**DEMOTED** = dropped below 80% win rate"
+                "**DEMOTED** = dropped below threshold"
             )
+        else:
+            st.info("No wallets match the current filters.")
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # TAB 3 — Open positions
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 with tab_open:
     st.header("Open Positions")
+    st.info(f"{phase_label}  |  {games} / {PHASE_THRESHOLD} games completed")
 
     open_pos = db.get_open_positions()
 
@@ -218,7 +315,8 @@ with tab_open:
             })
 
         df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        styled = df.style.map(_pnl_cell_style, subset=["Unrealised P&L"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
         total_unr = sum(
             p["token_amount"] * (p.get("current_price") or p["entry_price"]) - p["size_usd"]
@@ -227,11 +325,12 @@ with tab_open:
         st.metric("Total Unrealised P&L", fmt_usd(total_unr))
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # TAB 4 — Closed positions
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 with tab_closed:
     st.header("Closed Positions")
+    st.info(f"{phase_label}  |  {games} / {PHASE_THRESHOLD} games completed")
 
     closed_pos = db.get_closed_positions()
 
@@ -252,7 +351,8 @@ with tab_closed:
             })
 
         df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        styled = df.style.map(_pnl_cell_style, subset=["Realised P&L"])
+        st.dataframe(styled, use_container_width=True, hide_index=True)
 
         tot = sum((p.get("realised_pnl") or 0.0) for p in closed_pos)
         wins = sum(1 for p in closed_pos if p["result"] == "win")
@@ -264,11 +364,12 @@ with tab_closed:
         sc3.metric("Losses", losses)
 
 
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 # TAB 5 — Manual override
-# ════════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════════════
 with tab_override:
     st.header("Manual Position Top-Up")
+    st.info(f"{phase_label}  |  {games} / {PHASE_THRESHOLD} games completed")
     st.markdown(
         "Add extra capital to an open position. "
         "Bypasses Kelly sizing but still respects the "
@@ -290,7 +391,6 @@ with tab_override:
         selected_id = options[selected_label]
         pos = next(p for p in open_pos if p["id"] == selected_id)
 
-        # Compute remaining game cap
         portfolio = db.get_latest_portfolio()
         portfolio_value = portfolio["total_value"] if portfolio else STARTING_CAPITAL
         game_cap = portfolio_value * GAME_CAP_PCT
@@ -340,6 +440,76 @@ with tab_override:
                     st.rerun()
                 else:
                     st.error("Top-up failed — check bot.log for details")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — Settings
+# ════════════════════════════════════════════════════════════════════════════════
+with tab_settings:
+    st.header("Bot Settings")
+    st.info(f"{phase_label}  |  {games} / {PHASE_THRESHOLD} games completed")
+    st.warning(
+        "Saving writes the new values to `.env` and restarts the `polymarket-bot` "
+        "systemd service. Ensure the service is configured before using this."
+    )
+
+    s1, s2 = st.columns(2)
+    with s1:
+        new_win_rate = st.slider(
+            "WIN_RATE_THRESHOLD",
+            min_value=0.50, max_value=0.95, step=0.05,
+            value=float(WIN_RATE_THRESHOLD), format="%.2f",
+            help="Minimum win rate to follow a whale",
+        )
+        new_game_cap = st.slider(
+            "GAME_CAP_PCT",
+            min_value=0.01, max_value=0.15, step=0.01,
+            value=float(GAME_CAP_PCT), format="%.2f",
+            help="Max fraction of portfolio per game",
+        )
+    with s2:
+        new_min_trades = st.number_input(
+            "MIN_TRADES_ELIGIBLE",
+            min_value=3, max_value=20, value=int(MIN_TRADES_ELIGIBLE),
+            help="Min WC trades before a wallet is eligible",
+        )
+        new_min_size = st.number_input(
+            "MIN_TRADE_SIZE_USD",
+            min_value=1000, max_value=50000, step=500,
+            value=int(MIN_TRADE_SIZE_USD),
+            help="Only track whale trades >= this value (USD)",
+        )
+        new_phase_threshold = st.number_input(
+            "PHASE_THRESHOLD",
+            min_value=1, max_value=48, value=int(PHASE_THRESHOLD),
+            help="Switch from collection to live trading after this many games",
+        )
+
+    st.divider()
+
+    if st.button("💾 Save & Apply", type="primary"):
+        try:
+            _write_env_key("WIN_RATE_THRESHOLD", f"{new_win_rate:.2f}")
+            _write_env_key("GAME_CAP_PCT", f"{new_game_cap:.2f}")
+            _write_env_key("MIN_TRADES_ELIGIBLE", str(int(new_min_trades)))
+            _write_env_key("MIN_TRADE_SIZE_USD", str(int(new_min_size)))
+            _write_env_key("PHASE_THRESHOLD", str(int(new_phase_threshold)))
+
+            result = subprocess.run(
+                ["sudo", "systemctl", "restart", "polymarket-bot"],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                st.success("✅ Settings saved and bot restarted")
+            else:
+                st.success("✅ Settings saved to .env")
+                st.warning(
+                    f"Bot restart exited with code {result.returncode}. "
+                    f"Restart manually if needed. ({result.stderr.strip()})"
+                )
+        except Exception as exc:
+            st.error(f"Error saving settings: {exc}")
+
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 st.divider()

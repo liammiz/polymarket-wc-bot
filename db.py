@@ -41,6 +41,7 @@ def init_db() -> None:
                 active          INTEGER DEFAULT 1,
                 resolved        INTEGER DEFAULT 0,
                 winning_outcome TEXT,
+                end_date        TEXT,
                 created_at      TEXT,
                 last_checked    TEXT
             );
@@ -123,6 +124,11 @@ def init_db() -> None:
             INSERT OR IGNORE INTO phase_tracking (id, games_completed, last_updated)
             VALUES (1, 0, datetime('now'));
         """)
+        # Migration: add end_date to existing DBs that predate this column
+        try:
+            conn.execute("ALTER TABLE markets ADD COLUMN end_date TEXT")
+        except Exception:
+            pass  # column already exists
     logger.info("Database initialised at %s", DB_PATH)
 
 
@@ -148,22 +154,24 @@ def upsert_market(
     market_id: str, name: str, question: str,
     active: bool = True, resolved: bool = False,
     winning_outcome: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with get_conn() as conn:
         conn.execute(
             """
             INSERT INTO markets (market_id, market_name, question, active, resolved,
-                                 winning_outcome, created_at, last_checked)
-            VALUES (?,?,?,?,?,?,?,?)
+                                 winning_outcome, end_date, created_at, last_checked)
+            VALUES (?,?,?,?,?,?,?,?,?)
             ON CONFLICT(market_id) DO UPDATE SET
                 active          = excluded.active,
                 resolved        = excluded.resolved,
                 winning_outcome = COALESCE(excluded.winning_outcome, winning_outcome),
+                end_date        = COALESCE(excluded.end_date, end_date),
                 last_checked    = excluded.last_checked
             """,
             (market_id, name[:200], question[:500],
-             int(active), int(resolved), winning_outcome, now, now),
+             int(active), int(resolved), winning_outcome, end_date, now, now),
         )
 
 
@@ -451,6 +459,17 @@ def get_latest_portfolio() -> Optional[Dict]:
             "SELECT * FROM portfolio_snapshots ORDER BY snapshot_at DESC LIMIT 1"
         ).fetchone()
         return dict(row) if row else None
+
+
+def get_portfolio_snapshots(limit: int = 500) -> List[Dict]:
+    with get_conn() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                "SELECT * FROM portfolio_snapshots ORDER BY snapshot_at ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        ]
 
 
 # ── Phase tracking ────────────────────────────────────────────────────────────
