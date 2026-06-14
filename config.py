@@ -18,7 +18,7 @@ POLY_CHAIN_ID: int = int(os.getenv("POLY_CHAIN_ID", "137"))  # Polygon mainnet
 
 # Bot behaviour
 STARTING_CAPITAL: float = float(os.getenv("STARTING_CAPITAL", "10000"))
-MIN_TRADE_SIZE_USD: float = float(os.getenv("MIN_TRADE_SIZE_USD", "5000"))
+MIN_TRADE_SIZE_USD: float = float(os.getenv("MIN_TRADE_SIZE_USD", "2000"))
 WIN_RATE_THRESHOLD: float = float(os.getenv("WIN_RATE_THRESHOLD", "0.80"))
 GAME_CAP_PCT: float = float(os.getenv("GAME_CAP_PCT", "0.07"))
 MIN_TRADES_ELIGIBLE: int = int(os.getenv("MIN_TRADES_ELIGIBLE", "5"))

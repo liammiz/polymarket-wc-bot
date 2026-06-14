@@ -11,6 +11,7 @@ Phase 1 (games_completed < PHASE_THRESHOLD): data collection only.
 Phase 2 (games_completed >= PHASE_THRESHOLD): live/dry-run copy-trading.
 """
 
+import json
 import logging
 import logging.handlers
 import signal
@@ -55,6 +56,8 @@ def setup_logging() -> None:
 
 logger = logging.getLogger(__name__)
 
+GAMMA_BASE_URL = "https://gamma-api.polymarket.com"
+
 # /trades requires L2-authenticated requests; build the client once so the
 # signing key/creds aren't re-derived every poll cycle.
 _clob_client = ClobClient(
@@ -84,6 +87,37 @@ def _is_wc_market(question: str) -> bool:
 
 def _now_ts() -> int:
     return int(datetime.now(timezone.utc).timestamp())
+
+
+def _extract_winning_outcome(gm: dict) -> Optional[str]:
+    """
+    Determine the winning outcome of a resolved Gamma API market record.
+
+    The Gamma /markets response has no direct "winner"/"resolution" field —
+    only `outcomes` (JSON array of outcome names) and `outcomePrices` (JSON
+    array of settlement prices). A winning share settles at 1.0 and a losing
+    share at 0.0, so the outcome with the highest price is the winner.
+    """
+    try:
+        outcomes = json.loads(gm.get("outcomes") or "[]")
+        prices = json.loads(gm.get("outcomePrices") or "[]")
+    except (ValueError, TypeError):
+        return None
+
+    if not outcomes or not prices or len(outcomes) != len(prices):
+        return None
+
+    try:
+        best_idx, best_price = max(
+            enumerate(prices), key=lambda ip: float(ip[1])
+        )
+    except (ValueError, TypeError):
+        return None
+
+    if float(best_price) < 0.5:
+        return None  # no clear winner yet
+
+    return outcomes[best_idx]
 
 
 def _parse_trade(raw: dict) -> Optional[Dict]:
@@ -199,65 +233,87 @@ def refresh_wc_markets() -> None:
 
 def check_market_resolutions() -> None:
     """
-    For each unresolved market, query the API for resolution status.
-    When resolved: update trade outcomes, wallet scores, positions, game counter.
+    Fetch recently closed markets from the Gamma API in a single bulk call
+    and cross-reference against our DB's unresolved markets.
 
-    Only considers markets that are active and were last seen active within
-    the past 7 days, to avoid grinding through stale/delisted markets.
+    This replaces the old approach of making one CLOB API call per tracked
+    market (thousands of requests), which could hang long enough for
+    APScheduler to report "maximum number of running instances reached" on
+    every subsequent run.
     """
-    markets = db.get_markets_to_check()
-    logger.info("Checking resolutions for %d market(s)", len(markets))
+    logger.info("Checking for resolved markets…")
     checked = 0
+    resolved_count = 0
 
-    for m in markets:
-        try:
-            resp = requests.get(
-                f"{CLOB_BASE_URL}/markets/{m['market_id']}", timeout=10
-            )
-            checked += 1
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
+    try:
+        resp = requests.get(
+            f"{GAMMA_BASE_URL}/markets",
+            params={"closed": "true", "limit": 100},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        gamma_markets = resp.json()
+        checked = len(gamma_markets)
 
-            is_resolved = bool(data.get("resolved"))
-            winning_outcome = data.get("outcome") or data.get("winning_outcome")
+        unresolved = {
+            m["market_id"]: m
+            for m in db.get_markets_to_check()
+        }
 
-            if not (is_resolved and winning_outcome):
-                continue
+        for gm in gamma_markets:
+            try:
+                condition_id = gm.get("conditionId")
+                if not condition_id or condition_id not in unresolved:
+                    continue
 
-            logger.info(
-                "Market resolved: '%s'  winner=%s", m["market_name"], winning_outcome
-            )
+                m = unresolved[condition_id]
 
-            db.mark_market_resolved(m["market_id"], winning_outcome)
-            db.resolve_wallet_trades(m["market_id"], winning_outcome)
+                # Gamma exposes no direct "winner"/"resolution" field — the
+                # winning outcome is inferred from outcomePrices.
+                winning_outcome = _extract_winning_outcome(gm)
+                if not winning_outcome:
+                    continue
 
-            # Re-score wallets and fire promotion/demotion alerts
-            changes = scorer.recalculate_all_wallet_scores()
-            for ch in changes:
-                addr = ch["address"]
-                if ch["old_status"] != "followed" and ch["new_status"] == "followed":
-                    alerter.alert_whale_promoted(addr, ch["win_rate"], ch["trade_count"])
-                elif ch["old_status"] == "followed" and ch["new_status"] != "followed":
-                    alerter.alert_whale_demoted(addr, ch["win_rate"])
-
-            # Close our copied positions
-            for pos, result, pnl in executor.close_resolved_positions(
-                m["market_id"], winning_outcome
-            ):
-                alerter.alert_position_closed(
-                    pos["market_name"], pos["outcome"], pos["size_usd"], result, pnl
+                logger.info(
+                    "Market resolved: '%s'  winner=%s", m["market_name"], winning_outcome
                 )
 
-            games = db.increment_games_completed()
-            logger.info("Games completed: %d", games)
-        except Exception as exc:
-            logger.error(
-                "Resolution check failed for market %s: %s", m["market_id"], exc
-            )
-            continue
+                db.mark_market_resolved(m["market_id"], winning_outcome)
+                db.resolve_wallet_trades(m["market_id"], winning_outcome)
 
-    logger.info("Resolution check done: %d/%d market(s) checked", checked, len(markets))
+                # Re-score wallets and fire promotion/demotion alerts
+                changes = scorer.recalculate_all_wallet_scores()
+                for ch in changes:
+                    addr = ch["address"]
+                    if ch["old_status"] != "followed" and ch["new_status"] == "followed":
+                        alerter.alert_whale_promoted(addr, ch["win_rate"], ch["trade_count"])
+                    elif ch["old_status"] == "followed" and ch["new_status"] != "followed":
+                        alerter.alert_whale_demoted(addr, ch["win_rate"])
+
+                # Close our copied positions
+                for pos, result, pnl in executor.close_resolved_positions(
+                    m["market_id"], winning_outcome
+                ):
+                    alerter.alert_position_closed(
+                        pos["market_name"], pos["outcome"], pos["size_usd"], result, pnl
+                    )
+
+                games = db.increment_games_completed()
+                logger.info("Games completed: %d", games)
+                resolved_count += 1
+            except Exception as exc:
+                logger.error(
+                    "Resolution processing failed for market %s: %s",
+                    gm.get("conditionId"), exc,
+                )
+                continue
+    except Exception as exc:
+        logger.error("Gamma resolution fetch failed: %s", exc)
+
+    logger.info(
+        "Resolution check done: checked %d closed market(s) from Gamma, resolved %d",
+        checked, resolved_count,
+    )
 
 
 # ── Main trade poll ───────────────────────────────────────────────────────────
@@ -466,7 +522,7 @@ def main() -> None:
     scheduler.add_job(refresh_wc_markets, "interval", minutes=10, id="markets")
     scheduler.add_job(
         check_market_resolutions, "interval", minutes=5, id="resolutions",
-        max_instances=1, coalesce=True,
+        max_instances=1, coalesce=True, misfire_grace_time=120,
     )
     scheduler.add_job(send_daily_summary, "cron", hour=0, minute=0, id="summary")
     scheduler.start()
