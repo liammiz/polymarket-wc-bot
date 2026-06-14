@@ -34,4 +34,6 @@ LOG_PATH = BASE_DIR / "bot.log"
 
 # API
 CLOB_BASE_URL: str = os.getenv("CLOB_BASE_URL", "https://clob.polymarket.com")
-WC_KEYWORDS: list = ["World Cup", "FIFA", "2026"]
+# "2026" alone is deliberately excluded — too many non-WC markets
+# (e.g. "2026 NBA Championship") contain the year.
+WC_KEYWORDS: list = ["World Cup", "FIFA"]

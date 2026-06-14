@@ -1,7 +1,7 @@
 import sqlite3
 import logging
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Dict
 
 from config import DB_PATH
@@ -200,6 +200,24 @@ def get_active_wc_markets() -> List[Dict]:
             dict(r)
             for r in conn.execute(
                 "SELECT * FROM markets WHERE active=1 AND resolved=0"
+            ).fetchall()
+        ]
+
+
+def get_markets_to_check(days: int = 7) -> List[Dict]:
+    """Active, unresolved markets that were still active as of `days` ago.
+
+    Used by check_market_resolutions() to avoid polling stale/delisted
+    markets that no longer show up in refresh_wc_markets().
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with get_conn() as conn:
+        return [
+            dict(r)
+            for r in conn.execute(
+                """SELECT * FROM markets
+                   WHERE active=1 AND resolved=0 AND last_checked >= ?""",
+                (cutoff,),
             ).fetchall()
         ]
 

@@ -72,6 +72,12 @@ _clob_client = ClobClient(
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _is_wc_market(question: str) -> bool:
+    """A market must explicitly reference "World Cup" or "FIFA" to qualify.
+
+    The bare year "2026" is not sufficient on its own — it also appears in
+    unrelated markets (e.g. "Will the New York Knicks win the 2026 NBA
+    Championship"), which would otherwise be misclassified as WC 2026 markets.
+    """
     ql = question.lower()
     return any(kw.lower() in ql for kw in WC_KEYWORDS)
 
@@ -195,54 +201,63 @@ def check_market_resolutions() -> None:
     """
     For each unresolved market, query the API for resolution status.
     When resolved: update trade outcomes, wallet scores, positions, game counter.
-    """
-    markets = db.get_all_markets()
-    for m in markets:
-        if m["resolved"]:
-            continue
 
+    Only considers markets that are active and were last seen active within
+    the past 7 days, to avoid grinding through stale/delisted markets.
+    """
+    markets = db.get_markets_to_check()
+    logger.info("Checking resolutions for %d market(s)", len(markets))
+    checked = 0
+
+    for m in markets:
         try:
             resp = requests.get(
-                f"{CLOB_BASE_URL}/markets/{m['market_id']}", timeout=15
+                f"{CLOB_BASE_URL}/markets/{m['market_id']}", timeout=10
             )
+            checked += 1
             if resp.status_code != 200:
                 continue
             data = resp.json()
-        except Exception:
-            continue
 
-        is_resolved = bool(data.get("resolved"))
-        winning_outcome = data.get("outcome") or data.get("winning_outcome")
+            is_resolved = bool(data.get("resolved"))
+            winning_outcome = data.get("outcome") or data.get("winning_outcome")
 
-        if not (is_resolved and winning_outcome):
-            continue
+            if not (is_resolved and winning_outcome):
+                continue
 
-        logger.info(
-            "Market resolved: '%s'  winner=%s", m["market_name"], winning_outcome
-        )
-
-        db.mark_market_resolved(m["market_id"], winning_outcome)
-        db.resolve_wallet_trades(m["market_id"], winning_outcome)
-
-        # Re-score wallets and fire promotion/demotion alerts
-        changes = scorer.recalculate_all_wallet_scores()
-        for ch in changes:
-            addr = ch["address"]
-            if ch["old_status"] != "followed" and ch["new_status"] == "followed":
-                alerter.alert_whale_promoted(addr, ch["win_rate"], ch["trade_count"])
-            elif ch["old_status"] == "followed" and ch["new_status"] != "followed":
-                alerter.alert_whale_demoted(addr, ch["win_rate"])
-
-        # Close our copied positions
-        for pos, result, pnl in executor.close_resolved_positions(
-            m["market_id"], winning_outcome
-        ):
-            alerter.alert_position_closed(
-                pos["market_name"], pos["outcome"], pos["size_usd"], result, pnl
+            logger.info(
+                "Market resolved: '%s'  winner=%s", m["market_name"], winning_outcome
             )
 
-        games = db.increment_games_completed()
-        logger.info("Games completed: %d", games)
+            db.mark_market_resolved(m["market_id"], winning_outcome)
+            db.resolve_wallet_trades(m["market_id"], winning_outcome)
+
+            # Re-score wallets and fire promotion/demotion alerts
+            changes = scorer.recalculate_all_wallet_scores()
+            for ch in changes:
+                addr = ch["address"]
+                if ch["old_status"] != "followed" and ch["new_status"] == "followed":
+                    alerter.alert_whale_promoted(addr, ch["win_rate"], ch["trade_count"])
+                elif ch["old_status"] == "followed" and ch["new_status"] != "followed":
+                    alerter.alert_whale_demoted(addr, ch["win_rate"])
+
+            # Close our copied positions
+            for pos, result, pnl in executor.close_resolved_positions(
+                m["market_id"], winning_outcome
+            ):
+                alerter.alert_position_closed(
+                    pos["market_name"], pos["outcome"], pos["size_usd"], result, pnl
+                )
+
+            games = db.increment_games_completed()
+            logger.info("Games completed: %d", games)
+        except Exception as exc:
+            logger.error(
+                "Resolution check failed for market %s: %s", m["market_id"], exc
+            )
+            continue
+
+    logger.info("Resolution check done: %d/%d market(s) checked", checked, len(markets))
 
 
 # ── Main trade poll ───────────────────────────────────────────────────────────
@@ -449,7 +464,10 @@ def main() -> None:
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(poll_trades, "interval", seconds=POLL_INTERVAL_SECONDS, id="poll")
     scheduler.add_job(refresh_wc_markets, "interval", minutes=10, id="markets")
-    scheduler.add_job(check_market_resolutions, "interval", minutes=5, id="resolutions")
+    scheduler.add_job(
+        check_market_resolutions, "interval", minutes=5, id="resolutions",
+        max_instances=1, coalesce=True,
+    )
     scheduler.add_job(send_daily_summary, "cron", hour=0, minute=0, id="summary")
     scheduler.start()
     logger.info("Scheduler running. Poll interval=%ds", POLL_INTERVAL_SECONDS)
